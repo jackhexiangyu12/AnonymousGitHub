@@ -1,6 +1,4 @@
-# CAMP-IE: minimal anonymous code
-
-This anonymous repository contains only the core code needed to inspect the frozen multimodal conditioner and analyze attention heads. It intentionally omits benchmark evaluation, image generation experiments, plotting, judge models, and paper-table reproduction.
+# CAMP-IE: anonymous code
 
 The implementation follows the paper's core mechanism:
 
