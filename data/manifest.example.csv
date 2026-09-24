@@ -1,0 +1,7 @@
+sample_id,image,instruction,direction_pair_id,direction_label,tuple_id,source_level,edit_level,variant
+calib_b_000,path/to/calibration_benign.jpg,"benign calibration instruction",pair_000,0,,,,
+calib_h_000,path/to/calibration_harmful.jpg,"matched harmful calibration instruction",pair_000,1,,,,
+tuple_000_00,path/to/S0.jpg,"A0 control edit",,,tuple_000,0,0,canonical
+tuple_000_01,path/to/S0.jpg,"A1 target edit",,,tuple_000,0,1,canonical
+tuple_000_10,path/to/S1.jpg,"A0 control edit",,,tuple_000,1,0,canonical
+tuple_000_11,path/to/S1.jpg,"A1 target edit",,,tuple_000,1,1,canonical

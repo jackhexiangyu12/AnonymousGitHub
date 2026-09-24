@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "campie-anonymous"
+version = "0.1.0"
+description = "Minimal anonymous implementation for conditioner attention-head analysis"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.4",
+  "transformers>=4.51",
+  "accelerate>=1.1",
+  "numpy>=1.26",
+  "pandas>=2.2",
+  "Pillow>=10.0",
+  "safetensors>=0.4",
+]
+
+[tool.setuptools]
+packages = ["campie"]
