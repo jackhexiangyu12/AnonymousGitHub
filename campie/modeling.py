@@ -1,87 +1,79 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 from typing import Any
 
 import torch
 from PIL import Image
-from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2VLProcessor
+from diffusers import QwenImageEditPipeline
+from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, Qwen2VLProcessor
 
 
-# Prompt format used by the Qwen-Image-Edit conditioner. Keeping the conditioner
-# input format aligned with the official pipeline matters for head-level analysis.
-_QWEN_EDIT_TEMPLATE = (
-    "<|im_start|>system\n"
-    "Describe the key features of the input image (color, shape, size, texture, objects, background), "
-    "then explain how the user's text instruction should alter or modify the image. Generate a new image "
-    "that meets the user's requirements while maintaining consistency with the original input where appropriate."
-    "<|im_end|>\n"
-    "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n"
-    "<|im_start|>assistant\n"
-)
+class _ConditioningPassComplete(RuntimeError):
+    """Internal control-flow sentinel used to stop the official edit pipeline after prompt encoding."""
+
+    def __init__(self, encoded: Any):
+        super().__init__("conditioning pass complete")
+        self.encoded = encoded
 
 
 @dataclass
 class QwenConditioner:
-    model: Qwen2_5_VLForConditionalGeneration
-    processor: Qwen2VLProcessor
+    """Conditioning-only wrapper around the official Diffusers Qwen-Image-Edit pipeline.
+
+    CAMP-IE does not define a separate prompt serializer or source-image resize rule here.
+    The wrapper enters ``QwenImageEditPipeline.__call__`` and stops immediately after the
+    pipeline's own ``encode_prompt`` finishes, before any VAE/DiT work is reached. This
+    keeps the conditioner input path identical to the installed official pipeline while
+    avoiding image generation during feature extraction.
+    """
+
+    pipeline: QwenImageEditPipeline
     model_id: str
     revision: str | None = None
 
     @property
-    def device(self) -> torch.device:
-        try:
-            return next(self.model.parameters()).device
-        except StopIteration:
-            return torch.device("cpu")
+    def model(self) -> Qwen2_5_VLForConditionalGeneration:
+        return self.pipeline.text_encoder
 
-    def prepare_inputs(self, image: Image.Image, instruction: str) -> dict[str, torch.Tensor]:
-        image = resize_condition_image(image)
-        text = _QWEN_EDIT_TEMPLATE.format(str(instruction))
-        batch = self.processor(
-            text=[text],
-            images=[image],
-            padding=True,
-            return_tensors="pt",
-        )
-        # With accelerate/device_map, sending inputs to the embedding device is the
-        # safest default. For a single-device model this is simply model.device.
-        input_device = _input_device(self.model)
-        return {k: v.to(input_device) if torch.is_tensor(v) else v for k, v in batch.items()}
+    @property
+    def processor(self) -> Qwen2VLProcessor:
+        return self.pipeline.processor
 
     @torch.inference_mode()
     def encode(self, image: Image.Image, instruction: str) -> Any:
-        inputs = self.prepare_inputs(image, instruction)
-        return self.model(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            pixel_values=inputs.get("pixel_values"),
-            image_grid_thw=inputs.get("image_grid_thw"),
-            output_hidden_states=False,
-            use_cache=False,
-            return_dict=True,
-        )
+        """Run exactly the official Qwen-Image-Edit input/conditioning path, then stop.
 
+        The official pipeline owns both text serialization and image preprocessing.
+        We temporarily wrap ``encode_prompt`` only to terminate execution once the
+        multimodal conditioner has completed; the returned object is the official
+        prompt-encoding result. Attention hooks attached to ``self.model`` therefore
+        observe the same conditioner forward pass used by the edit pipeline.
+        """
+        image = image.convert("RGB")
+        original_encode_prompt = self.pipeline.encode_prompt
 
-def _input_device(model: torch.nn.Module) -> torch.device:
-    # The token embedding is a reliable entry point when a device map is active.
-    try:
-        return model.get_input_embeddings().weight.device
-    except Exception:
-        return next(model.parameters()).device
+        def _stop_after_encode(*args: Any, **kwargs: Any) -> Any:
+            encoded = original_encode_prompt(*args, **kwargs)
+            raise _ConditioningPassComplete(encoded)
 
+        self.pipeline.encode_prompt = _stop_after_encode  # type: ignore[method-assign]
+        try:
+            # Execution is intentionally intercepted after the official prompt encoder.
+            # No VAE encoding, DiT denoising, or image generation is reached.
+            self.pipeline(
+                image=image,
+                prompt=str(instruction),
+                num_inference_steps=1,
+                output_type="latent",
+                return_dict=True,
+            )
+        except _ConditioningPassComplete as done:
+            return done.encoded
+        finally:
+            self.pipeline.encode_prompt = original_encode_prompt  # type: ignore[method-assign]
 
-def resize_condition_image(image: Image.Image, target_area: int = 1024 * 1024, multiple: int = 32) -> Image.Image:
-    """Resize to the same ~1MP, multiple-of-32 geometry used by Qwen-Image-Edit."""
-    image = image.convert("RGB")
-    w, h = image.size
-    ratio = w / max(h, 1)
-    raw_w = math.sqrt(target_area * ratio)
-    raw_h = raw_w / ratio
-    new_w = max(multiple, round(raw_w / multiple) * multiple)
-    new_h = max(multiple, round(raw_h / multiple) * multiple)
-    return image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        raise RuntimeError("QwenImageEditPipeline did not execute encode_prompt as expected")
 
 
 def _parse_dtype(name: str) -> torch.dtype:
@@ -93,10 +85,15 @@ def _parse_dtype(name: str) -> torch.dtype:
         "fp32": torch.float32,
         "float32": torch.float32,
     }
-    key = name.lower()
-    if key not in table:
-        raise ValueError(f"unsupported dtype: {name}")
-    return table[key]
+    try:
+        return table[name.lower()]
+    except KeyError as exc:
+        raise ValueError(f"unsupported dtype: {name}") from exc
+
+
+def _load_component(cls: Any, model_id: str, subfolder: str, common: dict[str, Any], **kwargs: Any) -> Any:
+    """Load one component from the official Qwen-Image-Edit repository."""
+    return cls.from_pretrained(model_id, subfolder=subfolder, **common, **kwargs)
 
 
 def load_qwen_conditioner(
@@ -105,30 +102,45 @@ def load_qwen_conditioner(
     dtype: str = "bf16",
     device_map: str | None = "auto",
 ) -> QwenConditioner:
-    """Load only the frozen Qwen2.5-VL conditioner and its processor.
+    """Load only the frozen Qwen multimodal conditioner, using official pipeline preprocessing.
 
-    This intentionally avoids loading the DiT and VAE because CAMP-IE's head
-    localization is performed before image generation.
+    The heavyweight VAE and DiT are not loaded. A lightweight ``QwenImageEditPipeline``
+    object is constructed from the checkpoint's official text encoder, processor, and
+    tokenizer so that prompt serialization and source-image preprocessing are delegated
+    to Diffusers rather than duplicated in CAMP-IE.
     """
     common: dict[str, Any] = {"revision": revision} if revision else {}
     model_kwargs: dict[str, Any] = {
-        **common,
-        "subfolder": "text_encoder",
         "torch_dtype": _parse_dtype(dtype),
         "low_cpu_mem_usage": True,
     }
     if device_map:
         model_kwargs["device_map"] = device_map
 
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **model_kwargs)
+    model = _load_component(
+        Qwen2_5_VLForConditionalGeneration,
+        model_id,
+        "text_encoder",
+        common,
+        **model_kwargs,
+    )
+    processor = _load_component(Qwen2VLProcessor, model_id, "processor", common)
+    tokenizer = _load_component(Qwen2Tokenizer, model_id, "tokenizer", common)
 
-    try:
-        processor = Qwen2VLProcessor.from_pretrained(model_id, subfolder="processor", **common)
-    except OSError:
-        # Compatibility fallback for checkpoints that store processor files at root.
-        processor = Qwen2VLProcessor.from_pretrained(model_id, **common)
+    # QwenImageEditPipeline.__init__ accepts registered components; the generation-only
+    # components can remain absent because encode() stops immediately after encode_prompt.
+    pipeline = QwenImageEditPipeline(
+        scheduler=None,
+        vae=None,
+        text_encoder=model,
+        tokenizer=tokenizer,
+        processor=processor,
+        transformer=None,
+    )
+    pipeline.set_progress_bar_config(disable=True)
 
     model.eval()
-    for p in model.parameters():
-        p.requires_grad_(False)
-    return QwenConditioner(model=model, processor=processor, model_id=model_id, revision=revision)
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
+    return QwenConditioner(pipeline=pipeline, model_id=model_id, revision=revision)

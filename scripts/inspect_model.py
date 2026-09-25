@@ -8,7 +8,7 @@ from campie.modeling import load_qwen_conditioner
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Inspect the Qwen conditioner attention stack.")
+    p = argparse.ArgumentParser(description="Inspect the frozen multimodal conditioner attention stack.")
     p.add_argument("--model-id", default="Qwen/Qwen-Image-Edit")
     p.add_argument("--revision", default=None)
     p.add_argument("--dtype", default="bf16")

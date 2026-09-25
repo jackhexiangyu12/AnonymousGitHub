@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from typing import Iterable
+from typing import Iterable, Mapping
 
 import numpy as np
 import torch
@@ -29,48 +29,35 @@ def attention_shape(model: torch.nn.Module) -> tuple[int, int, int]:
 
 
 def discover_attention_output_projections(model: torch.nn.Module) -> list[AttentionOutputProjection]:
-    """Find Qwen2.5-VL language self-attention output projections.
-
-    We hook the input of ``o_proj`` so the captured tensor is the concatenated
-    per-head attention output before the output projection W_O.
-    """
+    """Resolve language self-attention ``o_proj`` modules in layer order."""
     num_layers, _, _ = attention_shape(model)
-    pattern = re.compile(r"(?:^|\.)language_model\.layers\.(\d+)\.self_attn\.o_proj$")
+    primary = re.compile(r"(?:^|\.)language_model\.layers\.(\d+)\.self_attn\.o_proj$")
+    fallback = re.compile(r"(?:^|\.)layers\.(\d+)\.self_attn\.o_proj$")
     found: dict[int, AttentionOutputProjection] = {}
 
     for name, module in model.named_modules():
-        m = pattern.search(name)
-        if m:
-            layer = int(m.group(1))
-            found[layer] = AttentionOutputProjection(layer=layer, name=name, module=module)
+        match = primary.search(name)
+        if match:
+            layer = int(match.group(1))
+            found[layer] = AttentionOutputProjection(layer, name, module)
 
-    # Fallback for transformers naming changes while still excluding the vision tower.
     if len(found) != num_layers:
-        fallback = re.compile(r"(?:^|\.)layers\.(\d+)\.self_attn\.o_proj$")
         for name, module in model.named_modules():
             if "visual" in name or "vision" in name:
                 continue
-            m = fallback.search(name)
-            if m:
-                layer = int(m.group(1))
-                found.setdefault(layer, AttentionOutputProjection(layer=layer, name=name, module=module))
+            match = fallback.search(name)
+            if match:
+                layer = int(match.group(1))
+                found.setdefault(layer, AttentionOutputProjection(layer, name, module))
 
-    missing = [i for i in range(num_layers) if i not in found]
+    missing = [layer for layer in range(num_layers) if layer not in found]
     if missing:
-        examples = [n for n, _ in list(model.named_modules()) if n.endswith("self_attn.o_proj")][:8]
-        raise RuntimeError(
-            f"could not resolve all language attention layers; missing={missing}; examples={examples}"
-        )
-    return [found[i] for i in range(num_layers)]
+        raise RuntimeError(f"could not resolve language attention output projections: missing {missing}")
+    return [found[layer] for layer in range(num_layers)]
 
 
 class HeadOutputRecorder:
-    """Record a selected token from every attention head before ``o_proj``.
-
-    Returned activations have shape ``[batch, layer, head, head_dim]``.
-    The paper-level analysis uses the final conditioning token, so ``token_index``
-    defaults to ``-1``.
-    """
+    """Record final-token per-head outputs immediately before ``W_O``."""
 
     def __init__(
         self,
@@ -92,7 +79,7 @@ class HeadOutputRecorder:
                 raise RuntimeError(f"expected [B,T,D] before o_proj, got {tuple(x.shape)}")
             expected = self.num_heads * self.head_dim
             if x.shape[-1] != expected:
-                raise RuntimeError(f"attention width {x.shape[-1]} != num_heads*head_dim ({expected})")
+                raise RuntimeError(f"attention width {x.shape[-1]} != {expected}")
             token = x[:, self.token_index, :].detach().float().cpu()
             self._cache[layer] = token.reshape(token.shape[0], self.num_heads, self.head_dim)
         return hook
@@ -112,7 +99,69 @@ class HeadOutputRecorder:
         self._cache.clear()
 
     def numpy(self) -> np.ndarray:
-        missing = [i for i in range(self.num_layers) if i not in self._cache]
+        missing = [layer for layer in range(self.num_layers) if layer not in self._cache]
         if missing:
             raise RuntimeError(f"no activation captured for layers: {missing}")
-        return np.stack([self._cache[i].numpy() for i in range(self.num_layers)], axis=1)
+        return np.stack([self._cache[layer].numpy() for layer in range(self.num_layers)], axis=1)
+
+
+class HeadOutputPatcher:
+    """Optional pre-``W_O`` patcher for matched residual interventions.
+
+    ``patches`` maps a layer to ``(head_indices, vectors)`` where vectors have
+    shape ``[K, head_dim]``. In ``mode="add"`` the vectors are added at the
+    fixed conditioning token and a negative ``alpha`` subtracts an interaction
+    residual. In ``mode="replace"`` the vectors replace the selected head
+    states, which supports natural-donor controls without synthesizing an
+    off-manifold arithmetic residual.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        patches: Mapping[int, tuple[np.ndarray, np.ndarray]],
+        alpha: float = -1.0,
+        token_index: int = -1,
+        projections: Iterable[AttentionOutputProjection] | None = None,
+        mode: str = "add",
+    ) -> None:
+        self.model = model
+        self.patches = patches
+        self.alpha = float(alpha)
+        self.token_index = int(token_index)
+        self.projections = list(projections or discover_attention_output_projections(model))
+        if mode not in {"add", "replace"}:
+            raise ValueError("mode must be 'add' or 'replace'")
+        self.mode = mode
+        self.num_layers, self.num_heads, self.head_dim = attention_shape(model)
+        self._handles: list[torch.utils.hooks.RemovableHandle] = []
+
+    def _pre_hook(self, layer: int):
+        def hook(_module, args):
+            if layer not in self.patches:
+                return None
+            x = args[0]
+            head_idx, vectors = self.patches[layer]
+            head_idx = np.asarray(head_idx, dtype=int)
+            vectors = np.asarray(vectors)
+            if vectors.shape != (len(head_idx), self.head_dim):
+                raise ValueError(f"bad patch shape for layer {layer}: {vectors.shape}")
+            y = x.clone()
+            view = y.reshape(y.shape[0], y.shape[1], self.num_heads, self.head_dim)
+            patch = torch.as_tensor(vectors, dtype=view.dtype, device=view.device)
+            if self.mode == "add":
+                view[:, self.token_index, head_idx, :] += self.alpha * patch[None, :, :]
+            else:
+                view[:, self.token_index, head_idx, :] = patch[None, :, :]
+            return (view.reshape_as(y),) + tuple(args[1:])
+        return hook
+
+    def __enter__(self):
+        for item in self.projections:
+            self._handles.append(item.module.register_forward_pre_hook(self._pre_hook(item.layer)))
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()

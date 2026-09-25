@@ -1,25 +1,27 @@
-"""Minimal CAMP-IE utilities for conditioner head extraction and factorial head analysis."""
+"""Core CAMP-IE implementation used for anonymous review."""
 
-from .modeling import QwenConditioner, load_qwen_conditioner
-from .hooks import HeadOutputRecorder, discover_attention_output_projections
+from .cis import CISState, load_cis_state
 from .head_analysis import (
-    HeadDirection,
     FactorialHeadEffects,
-    fit_harmfulness_direction,
-    project_head_scores,
+    HeadDirection,
+    StableHead,
     factorial_head_effects,
-    rank_positive_heads,
+    fit_layer_harmfulness_direction,
+    project_head_scores,
+    select_stable_heads,
 )
+from .protocol import CoreProtocol, DEFAULT_PROTOCOL
 
 __all__ = [
-    "QwenConditioner",
-    "load_qwen_conditioner",
-    "HeadOutputRecorder",
-    "discover_attention_output_projections",
-    "HeadDirection",
+    "CISState",
+    "CoreProtocol",
+    "DEFAULT_PROTOCOL",
     "FactorialHeadEffects",
-    "fit_harmfulness_direction",
-    "project_head_scores",
+    "HeadDirection",
+    "StableHead",
     "factorial_head_effects",
-    "rank_positive_heads",
+    "fit_layer_harmfulness_direction",
+    "load_cis_state",
+    "project_head_scores",
+    "select_stable_heads",
 ]
