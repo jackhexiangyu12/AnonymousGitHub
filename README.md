@@ -1,86 +1,10 @@
-# CAMP-IE: anonymous core implementation
+# CAMP-IE
 
-This repository contains the compact pre-generation implementation used by CAMP-IE. It focuses on the model and representation-analysis path: loading the frozen multimodal conditioner, extracting pre-`W_O` attention-head features, matched factorial localization of EHH/SHH/CHH families, robust CHH selection, and fitting the Contrastive Interaction Subspace (CIS) with its scalar request-level readout.
+Anonymous implementation for **CAMP-IE: Understanding Safety Risks in Multimodal Instruction Following Image Editing Models**.
 
-Benchmark evaluation, image generation, plotting, paper-table reproduction, automated harmfulness judging, adaptive attack generation, and released-baseline wrappers are intentionally outside the scope of this compact anonymous core package.
+This repository contains the core code used to extract attention-head features from the Qwen-Image-Edit conditioner, identify EHH/SHH/CHH head families with the matched factorial design, fit the Contrastive Interaction Subspace (CIS), and score requests before image generation.
 
-## Method path
-
-```text
-source image + edit instruction
-        |
-frozen multimodal conditioner
-        |
-pre-W_O final-conditioning-token head outputs
-        |
-layer-specific harmfulness direction r_H^(ell)
-        |
-matched 2 x 2 E / S / C effects
-        |
-stable EHH / SHH / CHH localization
-        |
-robust CHH pool
-        |
-CHH concatenation -> benign whitening
-        |
-Sigma_E, Sigma_S, Sigma_C
-        |
-generalized eigensystem -> thin QR -> CIS
-        |
-L2 linear request-label readout
-        |
-development 5% benign-FPR threshold
-        |
-ALLOW / BLOCK before DiT denoising
-```
-
-The implementation is independently written. RHF is useful as a general reference for attention-head activation analysis, but CAMP-IE uses a multimodal source-edit factorial objective rather than RHF's head taxonomy or scoring rule.
-
-## What is fixed explicitly
-
-`campie/protocol.py` records the numerical protocol used by the core implementation:
-
-- head output is recorded immediately before `W_O` at the fixed final conditioning token;
-- harmfulness direction is **one direction per conditioner layer**, estimated as a paired harmful-minus-benign mean difference after within-layer head averaging;
-- benign mean and standard deviation remain head-specific;
-- localization uses matched source-group bootstrap resampling (`R_boot=10,000` by default);
-- CHH deployment selection uses `Freq_h >= 0.80`, `SignCons_h >= 0.80`, and `CS_h <= 0.62`;
-- paired bootstrap confidence intervals are reported descriptively and are **not** multiplicity-corrected or used as the deployment selection rule by default;
-- whitening uses `epsilon_B = 0.05 tr(Sigma_B) / d_CIS`;
-- the main-effect penalty uses `gamma = 0.10 tr(Sigma_E + Sigma_S) / d_CIS`;
-- CIS rank is chosen from the training generalized eigenspectrum using the profile-likelihood scree criterion when `--rank auto` is used;
-- the CHH fraction is selected from `{0.125, 0.25, 0.5, 0.75, 1.0}` on development request labels when `--rho auto` is used;
-- logistic readout `C` is selected from `{0.1, 1, 10}` on development request-label log loss when `--readout-c auto` is used;
-- the block threshold is calibrated separately on benign development scores for empirical FPR at or below 5%.
-
-The fitted state and its companion JSON report record the number of whitening vectors, the number and rank of E/S/C contrast vectors before regularization, `epsilon_B`, `gamma`, selected rank, selected CHH fraction, selected readout regularization, and signed CIS-coordinate summaries. These are method diagnostics rather than benchmark metrics.
-
-## Repository layout
-
-```text
-campie/
-  modeling.py       Qwen-Image-Edit conditioner loading via the official Diffusers input path
-  hooks.py          pre-W_O recording; additive residual and natural-donor replacement hooks
-  data.py           factorial-manifest and train/dev/test separation checks
-  protocol.py       fixed numerical protocol
-  head_analysis.py  layer directions, E/S/C effects, bootstrap stability, carrier robustness
-  cis.py            CHH concatenation, whitening, CIS, readout, threshold, fit diagnostics
-scripts/
-  inspect_model.py
-  extract_conditioner_heads.py
-  analyze_factorial_heads.py
-  fit_cis.py
-  score_requests.py
-  screen_request.py
-data/
-  manifest.example.csv
-assets/
-  qualitative assets included with the anonymous submission
-tests/
-  test_core.py
-```
-
-## Install
+## Setup
 
 ```bash
 python -m venv .venv
@@ -88,43 +12,33 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-A CUDA-capable environment is recommended for conditioner extraction.
+A CUDA-capable environment is recommended for feature extraction.
 
-## 1. Inspect the conditioner
-
-```bash
-python scripts/inspect_model.py \
-  --model-id Qwen/Qwen-Image-Edit \
-  --revision YOUR_EXACT_CHECKPOINT_REVISION
-```
-
-The extractor resolves the language-model `self_attn.o_proj` modules and records their input, i.e. concatenated per-head output before `W_O`.
-
-### Official Qwen input path
-
-CAMP-IE does not maintain a second copy of the Qwen-Image-Edit prompt wrapper or image-resizing policy. `campie/modeling.py` constructs a conditioning-only `diffusers.QwenImageEditPipeline` from the checkpoint text encoder, tokenizer, and processor, enters the pipeline's normal `__call__` path, and terminates immediately after the pipeline's own `encode_prompt` returns. Consequently, text serialization and source-image preprocessing are inherited from the installed official Diffusers implementation rather than redefined in this repository. The activation archive records `conditioning_backend`, `diffusers_version`, and `transformers_version` together with the model checkpoint revision.
-
-## 2. Prepare the manifest
-
-See `data/manifest.example.csv`. Relevant fields are:
-
-- `direction_pair_id`, `direction_label`: pair-aligned harmful/benign direction-calibration examples;
-- `tuple_id`, `source_level`, `edit_level`, `variant`: matched factorial groups;
-- `risk_label`: request-level label, with only `(S1,A1)` positive inside a factorial tuple;
-- `split`, `source_group`, `normalized_edit_template`: train/dev/test separation metadata.
-
-Each `(tuple_id, variant)` contains exactly four cells:
+## Repository
 
 ```text
-(S0,A0) neutral source + control edit
-(S0,A1) neutral source + target edit
-(S1,A0) critical source + control edit
-(S1,A1) critical source + target edit
+campie/
+  modeling.py       model loading and conditioning
+  hooks.py          pre-W_O attention-head hooks
+  data.py           manifest checks and split validation
+  head_analysis.py  EHH / SHH / CHH analysis
+  cis.py            CIS fitting and request scoring
+
+scripts/
+  extract_conditioner_heads.py
+  analyze_factorial_heads.py
+  fit_cis.py
+  score_requests.py
+  screen_request.py
+
+assets/             qualitative examples
 ```
 
-`validate_manifest` rejects incomplete 2x2 groups, duplicated factorial cells, malformed calibration pairs, source-group leakage across train/dev/test, and normalized-template leakage across train/dev/test.
+## Data
 
-## 3. Extract pre-W_O head activations
+`data/manifest.example.csv` shows the expected manifest format. Each factorial group contains the four matched cells `(S0,A0)`, `(S0,A1)`, `(S1,A0)`, and `(S1,A1)`. Source groups and normalized edit templates are kept disjoint across train, development, and test splits.
+
+## Feature extraction
 
 ```bash
 python scripts/extract_conditioner_heads.py \
@@ -134,18 +48,17 @@ python scripts/extract_conditioner_heads.py \
   --revision YOUR_EXACT_CHECKPOINT_REVISION
 ```
 
-The main activation tensor has shape `[request, layer, head, head_dim]`. The saved file also records the exact model ID/revision, model head geometry, manifest row count, calibration-pair count, and factorial tuple counts.
+The extractor uses the official Diffusers Qwen-Image-Edit conditioning path and records the input to each attention `o_proj`, i.e. the per-head representation before `W_O`.
 
-## 4. Localize EHH / SHH / CHH families
+## Head analysis
 
 ```bash
 python scripts/analyze_factorial_heads.py \
   --activations outputs/activations.npz \
-  --output-dir outputs/head_analysis \
-  --bootstrap 10000
+  --output-dir outputs/head_analysis
 ```
 
-For every matched tuple/variant:
+For each matched group, the edit, source, and interaction effects are
 
 ```text
 E = 1/2 [(z01-z00) + (z11-z10)]
@@ -153,11 +66,9 @@ S = 1/2 [(z10-z00) + (z11-z01)]
 C =      z11-z10-z01+z00
 ```
 
-`head_selection.json` records, for each retained head, the mean standardized effect, paired bootstrap interval, source-group recurrence, carrier sign consistency, and carrier sensitivity. Carrier comparisons are matched to the canonical realization on the same tuple set, so missing carrier variants cannot change the reference population silently.
+The analysis script also applies the recurrence and carrier-robustness criteria used for CHH selection.
 
-The default deployment rule does not use the bootstrap interval as an additional significance filter. Use `--require-positive-ci` only for a stricter sensitivity analysis.
-
-## 5. Fit CIS
+## Fit CIS
 
 ```bash
 python scripts/fit_cis.py \
@@ -169,32 +80,9 @@ python scripts/fit_cis.py \
   --readout-c auto
 ```
 
-The fit is performed only from training activations/request labels plus development labels used for hyperparameter selection and threshold calibration. No generated-output harmfulness score or native-guard decision is used by the readout.
+This fits benign whitening, the generalized interaction subspace, and the linear request-level readout. The decision threshold is calibrated on the development split.
 
-Alongside `cis_state.npz`, the script writes `cis_state.json`. The JSON includes:
-
-- number of selected CHHs and resulting `d_CIS`;
-- number of benign whitening vectors and empirical covariance rank before regularization;
-- number of E/S/C contrast vectors and their row ranks;
-- numerical `epsilon_B` and `gamma`;
-- selected generalized-eigenspectrum rank;
-- development-selected `rho` and logistic `C`;
-- signed mean/std of each CIS coordinate for the four factorial cells and for the interaction contrast.
-
-The signed coordinate report is included to distinguish the unsupervised interaction-energy subspace from the supervised request-label readout; it is not an evaluation metric.
-
-## 6. One-pass pre-generation decision
-
-For previously extracted activations:
-
-```bash
-python scripts/score_requests.py \
-  --activations outputs/requests.npz \
-  --state outputs/cis_state.npz \
-  --output outputs/request_scores.csv
-```
-
-For a single source/edit request:
+## Screen a request
 
 ```bash
 python scripts/screen_request.py \
@@ -204,17 +92,8 @@ python scripts/screen_request.py \
   --revision YOUR_EXACT_CHECKPOINT_REVISION
 ```
 
-`screen_request.py` performs one normal conditioning pass, reads the selected pre-`W_O` heads, and returns `ALLOW` or `BLOCK`. It deliberately does not invoke the DiT. In the complete image-editing service, an `ALLOW` decision forwards the original conditioning state unchanged; `BLOCK` terminates before denoising.
+The script returns `ALLOW` or `BLOCK` from one conditioning pass and does not run the DiT generator.
 
-## Intervention primitive
+## Notes
 
-`HeadOutputPatcher` supports two operations at the same fixed pre-`W_O` token:
-
-- `mode="add"` with negative `alpha` for interaction-residual subtraction;
-- `mode="replace"` for natural-donor replacement with an observed head vector.
-
-The repository contains only the activation-editing primitive, not the generation/evaluation experiment around it.
-
-## Scope and assets
-
-`assets/` contains the qualitative examples supplied with the anonymous submission. Sensitive attack-generation templates, adaptive-search code, uncensored harmful outputs, benchmark judging pipelines, and external guard wrappers are not included in this compact anonymous repository.
+The repository is intentionally limited to the core CAMP-IE implementation. Benchmark evaluation, plotting, automated judging, adaptive attack generation, and external baseline wrappers are not included. The `assets/` directory contains the qualitative examples used in the anonymous submission.
